@@ -1,4 +1,8 @@
-use std::{default, net::UdpSocket, result};
+use std::{
+    default,
+    net::{Ipv4Addr, UdpSocket},
+    result,
+};
 
 use bytes::{BufMut, Bytes};
 use thiserror::Error;
@@ -9,12 +13,18 @@ pub enum DnsParseError {
     MaxJumpsExceeded,
     #[error("Reading past the end of buffer")]
     EndOfBuffer,
+    #[error("Unknown QTYPE {0}")]
+    UnknownQueryType(u16),
+    #[error("Unknown QCLASS {0}")]
+    UnknownQueryClass(u16),
+    #[error("Malformed IP V4 Address data field")]
+    MalformedIpV4Addr,
 }
 
 #[derive(Debug, Clone, Error)]
 pub enum DnsEncodeError {
-  #[error("Qname label exceeds maximum length 63")]
-  QnameLabelTooLong,
+    #[error("Qname label exceeds maximum length 63")]
+    QnameLabelTooLong,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -33,7 +43,7 @@ pub struct DnsPacketBuffer {
 
 impl DnsPacketBuffer {
     pub fn new(buffer: Vec<u8>, pos: usize) -> DnsPacketBuffer {
-      DnsPacketBuffer { buffer, pos: 0 }
+        DnsPacketBuffer { buffer, pos: 0 }
     }
 
     pub fn read_u8(&mut self) -> result::Result<u8, DnsParseError> {
@@ -44,6 +54,22 @@ impl DnsPacketBuffer {
         let high = self.read()?;
         let low = self.read()?;
         Ok((high as u16) << 8 | low as u16)
+    }
+
+    pub fn read_u32(&mut self) -> result::Result<u32, DnsParseError> {
+        let b1 = self.read()?;
+        let b2 = self.read()?;
+        let b3 = self.read()?;
+        let b4 = self.read()?;
+
+        let num = (b1 as u32) << 24 | (b2 as u32) << 16 | (b3 as u32) << 8 | (b4 as u32);
+        Ok(num)
+    }
+
+    pub fn read_slice(&mut self, len: usize) -> result::Result<&[u8], DnsParseError> {
+        let start = self.pos();
+        self.advance(len);
+        self.get_range(start, len)
     }
 
     pub fn get_range(&mut self, start: usize, len: usize) -> result::Result<&[u8], DnsParseError> {
@@ -131,6 +157,7 @@ impl DnsPacketBuffer {
         Ok(())
     }
 
+    #[inline(always)]
     fn read(&mut self) -> result::Result<u8, DnsParseError> {
         let val = self
             .buffer
@@ -239,85 +266,116 @@ impl DnsHeader {
 /// `https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.2`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
-  Unknown(u16),
-  A, // 1
+    A, // 1
 }
 
 impl QueryType {
-  pub fn to_num(self) -> u16 {
-    match self {
-        QueryType::Unknown(x) => x,
-        QueryType::A => 1,
+    pub fn to_num(self) -> u16 {
+        match self {
+            QueryType::A => 1,
+        }
     }
-  }
 
-  pub fn from_num(x: u16) -> QueryType {
-    match x {
-      1 => QueryType::A,
-      x => QueryType::Unknown(x),
+    pub fn from_num(x: u16) -> result::Result<QueryType, DnsParseError> {
+        match x {
+            1 => Ok(QueryType::A),
+            x => Err(DnsParseError::UnknownQueryType(x)),
+        }
     }
-  }
 }
 
 /// `https://datatracker.ietf.org/doc/html/rfc1035#section-3.2.4`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryClass {
-  Unknown(u16),
-  In, // 1 Internet
+    In, // 1 Internet
 }
 
 impl QueryClass {
-  pub fn to_num(self) -> u16 {
-    match self {
-      QueryClass::Unknown(x) => x,
-      QueryClass::In => 1,
+    pub fn to_num(self) -> u16 {
+        match self {
+            QueryClass::In => 1,
+        }
     }
-  }
 
-  pub fn from_num(x: u16) -> QueryClass {
-    match x {
-      1 => QueryClass::In,
-      x => QueryClass::Unknown(x),
+    pub fn from_num(x: u16) -> result::Result<QueryClass, DnsParseError> {
+        match x {
+            1 => Ok(QueryClass::In),
+            x => Err(DnsParseError::UnknownQueryClass(x)),
+        }
     }
-  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsQuestion {
-  qname: String,
-  qtype: QueryType,
-  qclass: QueryClass,
+    qname: String,
+    qtype: QueryType,
+    qclass: QueryClass,
 }
 
 impl DnsQuestion {
-  pub fn decode(buf: &mut DnsPacketBuffer) -> result::Result<DnsQuestion, DnsParseError> {
-    let mut qname = String::new();
-    buf.read_qname(&mut qname)?;
-    let qtype = QueryType::from_num(buf.read_u16()?);
-    let qclass = QueryClass::from_num(buf.read_u16()?);
+    pub fn decode(buf: &mut DnsPacketBuffer) -> result::Result<DnsQuestion, DnsParseError> {
+        let mut qname = String::new();
+        buf.read_qname(&mut qname)?;
+        let qtype = QueryType::from_num(buf.read_u16()?)?;
+        let qclass = QueryClass::from_num(buf.read_u16()?)?;
 
-    Ok(DnsQuestion { qname, qtype, qclass })
-  }
+        Ok(DnsQuestion {
+            qname,
+            qtype,
+            qclass,
+        })
+    }
 
-  pub fn encode(&self, out: &mut impl BufMut) -> result::Result<(), DnsEncodeError> {
-    encode_qname_plain(&self.qname, out)?;
-    out.put_u16(self.qtype.to_num());
-    out.put_u16(self.qclass.to_num());
-    Ok(())
-  }
+    pub fn encode(&self, out: &mut impl BufMut) -> result::Result<(), DnsEncodeError> {
+        encode_qname_plain(&self.qname, out)?;
+        out.put_u16(self.qtype.to_num());
+        out.put_u16(self.qclass.to_num());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum DnsRecord {
+    A {
+        domain: String,
+        addr: Ipv4Addr,
+        ttl: u32,
+    },
+}
+
+impl DnsRecord {
+    pub fn decode(buffer: &mut DnsPacketBuffer) -> result::Result<DnsRecord, DnsParseError> {
+        let mut domain = String::new();
+        buffer.read_qname(&mut domain)?;
+        let qtype = QueryType::from_num(buffer.read_u16()?)?;
+        let qclass = QueryClass::from_num(buffer.read_u16()?)?;
+        let ttl = buffer.read_u32()?;
+        let data_len = buffer.read_u16()?;
+        let data = buffer.read_slice(data_len as usize)?;
+
+        match (qtype, qclass) {
+            (QueryType::A, QueryClass::In) => {
+                let data: [u8; 4] = data
+                    .try_into()
+                    .map_err(|_| DnsParseError::MalformedIpV4Addr)?;
+                let addr = Ipv4Addr::from(data);
+                Ok(DnsRecord::A { domain, addr, ttl })
+            }
+        }
+    }
 }
 
 fn encode_qname_plain(qname: &str, out: &mut impl BufMut) -> result::Result<(), DnsEncodeError> {
-  let split = qname.split(".");
-  for s in split {
-    if s.len() > 63 {
-      return Err(DnsEncodeError::QnameLabelTooLong)
+    let split = qname.split(".");
+    for s in split {
+        if s.len() > 63 {
+            return Err(DnsEncodeError::QnameLabelTooLong);
+        }
+        out.put_u8(s.len() as u8);
+        out.put_slice(s.as_bytes());
     }
-    out.put_u8(s.len() as u8);
-    out.put_slice(s.as_bytes());
-  }
-  out.put_u8(0);
-  Ok(())
+    out.put_u8(0);
+    Ok(())
 }
 
 fn main() {
@@ -380,8 +438,8 @@ mod tests {
 
         let b = header.encode();
         let mut buffer = DnsPacketBuffer {
-          buffer: b.to_vec(),
-          pos: 0
+            buffer: b.to_vec(),
+            pos: 0,
         };
         let actual = DnsHeader::decode(&mut buffer).expect("Failed to decode header");
 
@@ -463,19 +521,19 @@ mod tests {
 
     #[test]
     fn test_question_serde() {
-      let question = DnsQuestion {
-        qname: "www.google.com".to_string(),
-        qtype: QueryType::A,
-        qclass: QueryClass::In,
-      };
+        let question = DnsQuestion {
+            qname: "www.google.com".to_string(),
+            qtype: QueryType::A,
+            qclass: QueryClass::In,
+        };
 
-      let mut buf = Vec::new();
-      question.encode(&mut buf).unwrap();
+        let mut buf = Vec::new();
+        question.encode(&mut buf).unwrap();
 
-      let mut buf = DnsPacketBuffer::new(buf, 0);
+        let mut buf = DnsPacketBuffer::new(buf, 0);
 
-      let actual = DnsQuestion::decode(&mut buf).unwrap();
+        let actual = DnsQuestion::decode(&mut buf).unwrap();
 
-      assert_eq!(question, actual);
+        assert_eq!(question, actual);
     }
 }
